@@ -1,0 +1,18 @@
+# Virtual Environment
+.venv/
+Scripts/
+
+# Python Cache
+__pycache__/
+*.pyc
+
+# Sensitif data / App Data
+cookies.txt
+cache.json
+
+# Log atau tmp script
+*.log
+*.txt
+!requirements.txt
+!README.md
+!prd.md

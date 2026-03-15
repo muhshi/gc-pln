@@ -540,18 +540,18 @@ def extract_rbm_from_region(region):
 
 def discover_rbms(cookies, xsrf_token):
     """Ambil daftar semua RBM dengan memindai berdasarkan prefix (dinamis bypass limit 10K)."""
-    log.info("Mencari daftar RBM (Region 4) menggunakan metode Prefix Search Dinamis...")
+    log.info("Mencari daftar RBM (Region 4) menggunakan metode Prefix Search Dinamis (DFS)...")
     rbms = {}
     
-    # Antrean prefix yang akan dicek. Semua RBM PLN diawali 'M' jadi kita mulai dari 'M'.
-    import string
-    queue = ["M"]
+    # Antrean prefix yang akan dicek. ID Pelanggan dan No Meter pasti mengandung angka
+    # Kita mulai dengan angka 0-9 untuk membagi ~100.000 data jadi chunk yang < 10.000.
+    queue = [str(i) for i in range(10)]
 
     while queue:
         prefix = queue.pop(0)
         
-        # Cek total dokumen untuk prefix ini
-        resp = fetch_assignments_page(cookies, xsrf_token, start=0, length=PAGE_SIZE, region4_id=None, search_keyword=prefix)
+        # Cek total dokumen untuk prefix ini dengan request length=1 agar cepat
+        resp = fetch_assignments_page(cookies, xsrf_token, start=0, length=1, region4_id=None, search_keyword=prefix)
         if not resp:
             continue
 
@@ -561,22 +561,16 @@ def discover_rbms(cookies, xsrf_token):
 
         # Jika total mencapai limit 10.000 Elasticsearch, kita harus pecah prefixnya
         if total >= 10000:
-            log.info(f"  Prefix '{prefix}' -> {total} records (KENA LIMIT). Memecah pencarian...")
-            # Tambahkan ke depan antrean (biar resolve cabang ini dulu, hemat memori)
-            sub_prefixes = [f"{prefix}{char}" for char in string.ascii_uppercase]
+            log.info(f"  Prefix '{prefix}' -> {total}+ records (KENA LIMIT). Memecah pencarian...")
+            # Tambahkan 0-9 ke depan antrean (DFS agar memori tidak habis)
+            sub_prefixes = [f"{prefix}{char}" for char in "0123456789"]
             queue = sub_prefixes + queue
             continue
             
-        log.info(f"  Prefix '{prefix}' -> {total} records (Aman). Memindai...")
+        log.info(f"  Prefix '{prefix}' -> {total} records (Aman). Memindai & Mengekstrak RBM...")
 
-        # Ekstrak data dari halaman pertama yang sudah di-fetch
-        for item in resp.get("searchData", []):
-            rbm_id, rbm_name = extract_rbm_from_region(item.get("region", {}))
-            if rbm_id:
-                rbms[rbm_id] = rbm_name
-
-        # Mulai dari halaman kedua
-        start = PAGE_SIZE
+        # Kita harus ambil semua records untuk prefix ini karena jumlahnya < 10.000
+        start = 0
         while start < total:
             random_delay()
             resp = fetch_assignments_page(cookies, xsrf_token, start=start, length=PAGE_SIZE, region4_id=None, search_keyword=prefix)
@@ -594,7 +588,7 @@ def discover_rbms(cookies, xsrf_token):
 
             start += PAGE_SIZE
 
-    log.info(f"Ditemukan {len(rbms)} RBM/Desa unik total.")
+    log.info(f"Ditemukan {len(rbms)} RBM/Desa unik total setelah full DFS scan.")
     return rbms
 
 
@@ -682,6 +676,24 @@ def scrape_rbm(cookies, xsrf_token, rbm_id, rbm_name, cache, num_workers):
     log.info(f"  RBM {rbm_name}: {total} records")
 
     all_assignments = resp.get("searchData", [])
+
+    # =========================================================
+    # EARLY STOP: Cek apakah RBM ini benar di Kabupaten Demak
+    # Ambil data pertama dari RBM ini dan cek wilayahnya
+    # =========================================================
+    if all_assignments:
+        first_id = all_assignments[0].get("id")
+        if first_id:
+            wilayah_resp = fetch_wilayah(cookies, xsrf_token, first_id)
+            if wilayah_resp and wilayah_resp.get("success"):
+                wil_data = wilayah_resp.get("data", {})
+                pre_defined = wil_data.get("pre_defined_data", "")
+                parsed = parse_pre_defined_data(pre_defined)
+                kab = parsed.get("kabupaten")
+                if kab and "DEMAK" not in kab.upper():
+                    log.info(f"  [SKIP] RBM {rbm_name} berada di {kab} (Bukan Demak).")
+                    return 0
+
     start = PAGE_SIZE
 
     # Fetch semua halaman
@@ -742,6 +754,8 @@ def main():
                         help="Abaikan cache, proses ulang semua")
     args = parser.parse_args()
 
+    start_time = time.time()  # Catat waktu mulai
+
     log.info("=" * 60)
     log.info("SCRAPING GC PLN - FASIH BPS")
     log.info(f"Tanggal  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -792,14 +806,38 @@ def main():
         # Save final cache
         save_cache(cache)
 
+        duration = time.time() - start_time
+        hours, rem = divmod(duration, 3600)
+        minutes, seconds = divmod(rem, 60)
+        duration_str = f"{int(hours)}j {int(minutes)}m {int(seconds)}d"
+
         log.info("\n" + "=" * 60)
-        log.info(f"SELESAI! Total {total_processed} records diproses")
-        log.info(f"Cache tersimpan di: {CACHE_FILE}")
+        log.info("REKAPITULASI AKHIR SCRAPING")
+        log.info("=" * 60)
+        log.info(f"Durasi Penarikan        : {duration_str}")
+        log.info(f"Total diproses sesi ini : {total_processed} records")
+        log.info(f"Total KUMULATIF SUKSES  : {len(cache.get('processed', []))} records")
+        log.info(f"Total GAGAL / SKIP      : {len(cache.get('failed', []))} records")
+        log.info(f"Total RBM Selesai       : {len(cache.get('rbms_done', []))} RBM")
+        log.info(f"Cache tersimpan di      : {CACHE_FILE}")
         log.info("=" * 60)
 
     except KeyboardInterrupt:
+        duration = time.time() - start_time
+        hours, rem = divmod(duration, 3600)
+        minutes, seconds = divmod(rem, 60)
+        duration_str = f"{int(hours)}j {int(minutes)}m {int(seconds)}d"
+
         log.info("\nDihentikan oleh user — cache tersimpan, bisa resume nanti")
         save_cache(cache)
+        log.info("\n" + "=" * 60)
+        log.info("REKAPITULASI SEMENTARA SCRAPING")
+        log.info("=" * 60)
+        log.info(f"Durasi Penarikan        : {duration_str}")
+        log.info(f"Total KUMULATIF SUKSES  : {len(cache.get('processed', []))} records")
+        log.info(f"Total GAGAL / SKIP      : {len(cache.get('failed', []))} records")
+        log.info(f"Total RBM Selesai       : {len(cache.get('rbms_done', []))} RBM")
+        log.info("=" * 60)
     except Exception as e:
         log.error(f"Error: {e}")
         save_cache(cache)
